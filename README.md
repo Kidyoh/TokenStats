@@ -8,11 +8,11 @@ Everything runs in the visitor's browser. People pick (or drag in) their own ses
 
 | Tool | Folder to pick | Contents | Token data |
 |---|---|---|---|
-| Claude Code | `~/.claude` | `projects/<project>/<session>.jsonl`, plus `<session>/subagents/*.jsonl` | yes |
-| Codex | `~/.codex` | `sessions/**/rollout-*.jsonl`, `archived_sessions/*.jsonl.zst`, `session_index.jsonl` (titles) | yes |
+| Claude Code | `~/.claude` | `projects/<project>/<session>.jsonl`, plus `<session>/subagents/*.jsonl`; `stats-cache.json` and `settings.json` for older usage (below) | yes |
+| Codex | `~/.codex` | `sessions/**/rollout-*.jsonl`, `archived_sessions/*.jsonl.zst`, `session_index.jsonl` (titles), `state_<n>.sqlite` (older usage, below) | yes |
 | OpenCode | `~/.local/share/opencode` | `opencode.db` (SQLite) and `opencode.db-wal` | yes |
 | Grok | `~/.grok` | `sessions/<cwd>/<id>/{chat_history.jsonl, summary.json, usage.json}` | newer sessions (`usage.json`) |
-| Antigravity | `~/.gemini/antigravity` | `conversations/<id>.db` (SQLite with protobuf steps), `conversation_summaries.db` | yes (inferred, see below) |
+| Antigravity | `~/.gemini/antigravity` | `conversations/<id>.db` (SQLite with protobuf steps), `conversation_summaries.db`; older `conversations/<id>.pb` are only counted | yes (inferred, see below) |
 | Cursor | `~/.cursor` | `projects/<project>/agent-transcripts/<id>/<id>.jsonl`, plus `<id>/subagents/*.jsonl` | estimated (see below) |
 
 On Windows, `~` is `%USERPROFILE%`. The folder pickers start in Documents, one level below these folders on a default install.
@@ -22,6 +22,11 @@ Limits:
 - **Antigravity** has no published schema. Its protobuf field numbers were mapped by hand (`src/lib/parsers/antigravity.ts`), so its token counts are a best-effort reading.
 - **Cursor** transcripts don't record tool output, token usage or per-message times. Cursor's older in-editor chat history lives in one multi-GB database, which is too large for a browser tab, so it isn't read.
 - **Estimated tokens**: when a tool records no usage (Cursor, older Grok sessions), tokens are counted from the transcript with the o200k tokenizer (`src/lib/estimate.ts`). Each model call is counted as re-sending the conversation so far (new text as input, the rest as cache reads), with the context compacted when it passes 200k. System prompts, tool definitions and Cursor's unrecorded tool output aren't included, and no model is recorded, so there's no cost. These numbers show with a `~`.
+- **Older usage** (`src/lib/history.ts`): some agents delete their session files but keep running totals, and those are added to the totals without counting anything twice.
+  - *Claude Code* deletes transcripts after `cleanupPeriodDays` (30 by default, in `~/.claude/settings.json`). `stats-cache.json` keeps per-model totals and per-day tokens up to its `lastComputedDate` (refreshed when `/stats` runs). For each model, the cache's total minus what the remaining transcripts hold up to that day is added, spread over days by what the cache recorded per day (and by message counts where it has no per-day tokens). Its input/output/cache split is estimated from that model's all-time mix. The days between the cache's last day and the oldest remaining transcript can't be counted, and the overview says so. A response copied into several transcripts (resumed or forked sessions) is counted once.
+  - *Codex* lists every thread with its total in `state_<n>.sqlite`. Threads whose rollout file is gone are added with that total, split like the same model's other sessions.
+  - *Cursor* keeps no token usage locally, and older *Antigravity* conversations (`.pb`) are encrypted; the overview says so rather than counting them as 0. *OpenCode* keeps everything in its database, and *Grok* sessions without `usage.json` are estimated.
+- **Codex** usage: `input_tokens` already includes cached input and `output_tokens` includes reasoning; each turn's tokens go to the model in use for that turn.
 - **Grok** cost is converted from xAI's "USD ticks" at 10¹⁰ ticks per dollar.
 
 ## Features

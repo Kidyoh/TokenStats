@@ -120,6 +120,12 @@
 		};
 		return arr.sort((a, b) => key[sort](a) - key[sort](b));
 	});
+	// Usage recovered from the agents' own totals has no session, title or text, so it's left out of a search;
+	// usage known only for a period counts in a date range when the whole period is inside it.
+	const older = $derived(
+		q.trim() || hits ? [] : app.history.filter((h) => tools.has(h.source) && (!project || h.cwd === project) && (!since || h.from >= since))
+	);
+	const notes = $derived(app.notes.filter((n) => tools.has(n.source) && present.includes(n.source) && (n.kind !== 'gap' || !since || (n.to ?? 0) >= since)));
 	const listTotal = $derived(filtered.reduce((a, s) => a + sessionTotal(s), 0));
 	const users = $derived(prefs.redact ? findUsernames(app.sessions.flatMap((s) => [s.cwd, s.path])) : []);
 	const show = (t: string | null | undefined) => (prefs.redact ? redactText(t, users).text : (t ?? ''));
@@ -309,7 +315,7 @@
 					{:else if view === 'time'}
 						<TimePage sessions={filtered} onopen={open} />
 					{:else}
-						<Overview bind:this={overview} sessions={filtered} rangeDays={range === 'all' ? null : Number(range)} onopen={open} />
+						<Overview bind:this={overview} sessions={filtered} history={older} {notes} rangeDays={range === 'all' ? null : Number(range)} onopen={open} />
 					{/if}
 				{/if}
 			</div>

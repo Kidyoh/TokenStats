@@ -39,7 +39,14 @@ export interface Summary {
 	estimated?: boolean;
 	/** tool calls and timing, for the Tools and Time pages */
 	stats?: SessionStats;
+	/** Claude Code: usage per model response, so a response copied into several files (resumed or forked sessions) is counted once */
+	calls?: Call[];
 }
+
+/** One model response's usage: message id, model, time, input, output, cache read, cache write */
+export type Call = [id: string, model: string, time: number | null, input: number, output: number, cache_read: number, cache_write: number];
+
+export const callTokens = (c: Call): Tokens => ({ input: c[3], output: c[4], cache_read: c[5], cache_write: c[6], reasoning: 0 });
 
 export interface SubagentRef {
 	id: string;

@@ -1,12 +1,13 @@
 import type { AgIndexEntry } from './parsers/antigravity';
-import { codexThreadNames } from './parsers/codex';
+import { codexThreadNames, type CodexThread } from './parsers/codex';
+import { claudeCoverage, claudeRetention, codexCoverage, dedupeCalls, otherNotes, parseClaudeStatsCache, subtractTokens, type Coverage, type CoverageNote, type HistoryEntry } from './history';
 import { idb } from './idb';
 import { collect, ensurePermission, type Entry, type Root } from './sources';
-import { addTokens, emptyTokens, TOOL_IDS, type Msg, type SearchHit, type Session, type Summary, type Tool } from './types';
+import { addTokens, emptyTokens, TOOL_IDS, type Call, type Msg, type SearchHit, type Session, type Summary, type Tokens, type Tool } from './types';
 import { Pool } from './worker/pool';
 import type { Unit } from './worker/protocol';
 
-const PARSER_VERSION = 5; // 5: summaries carry tool and time stats
+const PARSER_VERSION = 6; // 5: summaries carry tool and time stats · 6: Claude per-response usage, Codex per-model split
 const LRU_KEY = 'sb-recent-conversations';
 /** How many recently opened conversations to keep for reading before the next sync */
 const RECENT_LIMIT = 25;
@@ -104,6 +105,10 @@ class App {
 	/** roots remembered from an earlier visit that need a click to re-grant access */
 	pendingRoots = $state.raw<Root[]>([]);
 	sessions = $state.raw<Session[]>([]);
+	/** usage no session file holds any more, recovered from the agents' own running totals */
+	history = $state.raw<HistoryEntry[]>([]);
+	/** what the totals can't include, per tool */
+	notes = $state.raw<CoverageNote[]>([]);
 	phase = $state<'idle' | 'scanning' | 'ready'>('idle');
 	progress = $state({ done: 0, total: 0, label: '' });
 	errors = $state<string[]>([]);
@@ -124,9 +129,11 @@ class App {
 
 	async init() {
 		// Show the last sync right away; reading folders again needs access the browser may want re-granted.
-		const snap = await idb.get<{ sessions: Session[]; at: number }>('snapshot', 'last');
+		const snap = await idb.get<{ sessions: Session[]; at: number } & Partial<Coverage>>('snapshot', 'last');
 		if (snap?.sessions?.length) {
 			this.sessions = snap.sessions;
+			this.history = snap.history ?? [];
+			this.notes = snap.notes ?? [];
 			this.lastSync = snap.at;
 		}
 		const saved = await idb.all<Root>('roots');
@@ -227,7 +234,10 @@ class App {
 		if (this.roots.length) await this.scan();
 		else {
 			// Nothing left to read: keep only sessions from folders still waiting for access.
-			await idb.set('snapshot', 'last', { sessions: $state.snapshot(this.sessions), at: this.lastSync ?? Date.now() });
+			const left = new Set(this.sessions.map((s) => s.source));
+			this.history = this.history.filter((h) => left.has(h.source));
+			this.notes = this.notes.filter((n) => left.has(n.source));
+			await idb.set('snapshot', 'last', this.#snapshot(this.lastSync ?? Date.now()));
 			if (!this.sessions.length) {
 				await idb.del('snapshot', 'last');
 				this.lastSync = null;
@@ -246,6 +256,8 @@ class App {
 		this.roots = [];
 		this.pendingRoots = [];
 		this.sessions = [];
+		this.history = [];
+		this.notes = [];
 		this.lastSync = null;
 		this.live = false;
 		this.#index.clear();
@@ -292,18 +304,27 @@ class App {
 				}
 			}
 			this.roots = [...this.roots]; // tools/lastSync changed on the objects
-			const previous = this.sessions;
+			const previous = { sessions: this.sessions, history: this.history, notes: this.notes };
 			await this.#build(entries);
 			// Folders still waiting for access: keep their sessions from the last sync rather than dropping them.
 			const waitingTools = new Set(this.pendingRoots.flatMap((r) => r.tools ?? []));
-			const keep = previous.filter((s) => waitingTools.has(s.source) && !liveTools.has(s.source) && !this.#index.has(s.id));
+			const waiting = (t: Tool) => waitingTools.has(t) && !liveTools.has(t);
+			const keep = previous.sessions.filter((s) => waiting(s.source) && !this.#index.has(s.id));
 			if (keep.length) this.sessions = [...this.sessions, ...keep];
+			if (keep.length) {
+				this.history = [...this.history, ...previous.history.filter((h) => waiting(h.source))];
+				this.notes = [...this.notes, ...previous.notes.filter((n) => waiting(n.source))];
+			}
 			this.lastSync = Date.now();
 			this.live = true;
-			await idb.set('snapshot', 'last', { sessions: $state.snapshot(this.sessions), at: this.lastSync });
+			await idb.set('snapshot', 'last', this.#snapshot(this.lastSync));
 		} finally {
 			this.phase = 'ready';
 		}
+	}
+
+	#snapshot(at: number) {
+		return { sessions: $state.snapshot(this.sessions), history: $state.snapshot(this.history), notes: $state.snapshot(this.notes), at };
 	}
 
 	async #build(entries: Entry[]) {
@@ -338,6 +359,19 @@ class App {
 			}
 		};
 		await Promise.all(Array.from({ length: this.pool.size * 2 }, worker));
+
+		// Claude Code: a response copied into several files (resumed or forked sessions) counts once.
+		const claudeUnits = units.filter((u) => u.unit.tool === 'claude' && summaries.has(u.id));
+		const { calls, extra } = dedupeCalls(claudeUnits.map((u) => ({ id: u.id, start: summaries.get(u.id)!.start, calls: summaries.get(u.id)!.calls })));
+		for (const u of claudeUnits) {
+			const { calls: _, ...s } = summaries.get(u.id)!;
+			const x = extra.get(u.id);
+			if (x) {
+				s.tokens = subtractTokens(s.tokens, x.tokens);
+				s.models = Object.fromEntries(Object.entries(s.models).map(([m, t]) => [m, subtractTokens(t, x.models[m] ?? {})]));
+			}
+			summaries.set(u.id, s);
+		}
 
 		const names: Record<string, string> = {};
 		for (const e of entries.filter((x) => x.kind === 'codex-index')) Object.assign(names, codexThreadNames(await e.file.text()));
@@ -387,6 +421,61 @@ class App {
 
 		this.#index = index;
 		this.sessions = [...index.values()].map((l) => l.session);
+		const coverage = await this.#coverage(entries, units, summaries, calls);
+		this.history = coverage.history;
+		this.notes = coverage.notes;
+	}
+
+	/** Usage the session files no longer hold, and what can't be counted at all. */
+	async #coverage(entries: Entry[], units: ReturnType<typeof toUnits>, summaries: Map<string, Summary>, calls: Call[]): Promise<Coverage> {
+		const history: HistoryEntry[] = [];
+		const notes: CoverageNote[] = [];
+		const newest = (kind: Entry['kind']) => entries.filter((e) => e.kind === kind).sort((a, b) => b.file.lastModified - a.file.lastModified)[0];
+		const errors = this.errors;
+		const read = async <T>(e: Entry | undefined, fn: (text: string) => T): Promise<T | null> => {
+			try {
+				return e ? fn(await e.file.text()) : null;
+			} catch (err) {
+				errors.push(`${e!.path}: ${(err as Error).message}`);
+				return null;
+			}
+		};
+
+		const statsFile = newest('claude-stats');
+		if (calls.length || statsFile) {
+			const cache = await read(statsFile, parseClaudeStatsCache);
+			const settings = newest('claude-settings');
+			const retention = settings ? await read(settings, claudeRetention) : undefined;
+			const c = claudeCoverage({ cache, retention, calls });
+			history.push(...c.history);
+			notes.push(...c.notes);
+		}
+
+		const state = entries.filter((e) => e.kind === 'codex-state').sort((a, b) => b.path.localeCompare(a.path, undefined, { numeric: true }))[0];
+		if (state) {
+			const wal = entries.find((e) => e.kind === 'codex-state-wal' && e.path === state.path + '-wal');
+			try {
+				const threads = await this.pool.run<CodexThread[]>({ op: 'codex-state', db: state.file, wal: wal?.file ?? null });
+				const present = new Set(units.filter((u) => u.unit.tool === 'codex').map((u) => u.id.slice(6)));
+				const mixes: Record<string, Tokens> = {};
+				for (const u of units)
+					if (u.unit.tool === 'codex') for (const [m, t] of Object.entries(summaries.get(u.id)?.models ?? {})) addTokens((mixes[m] ??= emptyTokens()), t);
+				const c = codexCoverage(threads, present, mixes);
+				history.push(...c.history);
+				notes.push(...c.notes);
+			} catch (err) {
+				errors.push(`${state.path}: ${(err as Error).message}`);
+			}
+		}
+
+		const agDb = new Set(entries.filter((e) => e.kind === 'ag-db').map((e) => e.sid));
+		notes.push(
+			...otherNotes({
+				cursor: units.filter((u) => u.unit.tool === 'cursor' && !u.parent).length,
+				agEncrypted: entries.filter((e) => e.kind === 'ag-pb' && !agDb.has(e.sid)).length
+			})
+		);
+		return { history, notes };
 	}
 
 	session(id: string): Session | undefined {

@@ -15,6 +15,7 @@ export type Req =
 	| { op: 'summarize'; unit: Unit }
 	| { op: 'messages'; unit: Unit }
 	| { op: 'ag-index'; db: File; wal: File | null }
+	| { op: 'codex-state'; db: File; wal: File | null }
 	| { op: 'opencode-load'; db: File; wal: File | null; path: string }
 	| { op: 'opencode-messages'; sid: string }
 	| { op: 'opencode-search'; q: string }
