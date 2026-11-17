@@ -1,4 +1,4 @@
-import { addTokens, emptyTokens, type Msg, type Summary, type Tokens } from '../types';
+import { addTokens, emptyTokens, type Call, type Msg, type Summary, type Tokens } from '../types';
 import { clip, isMetaPrompt, lines, ms, oneLine, stripTagBlocks, tryJson } from './common';
 
 // Record types that are large and never needed for summaries or reading.
@@ -41,7 +41,7 @@ export function claudeSummary(text: string): Summary {
 	let nUser = 0;
 	let nAsst = 0;
 	// Streaming writes one line per content block with the same message id; keep one usage per id.
-	const usageById = new Map<string, [string, any]>();
+	const usageById = new Map<string, [string, any, number | null]>();
 
 	for (const line of lines(text)) {
 		if (skip(line)) continue;
@@ -74,7 +74,10 @@ export function claudeSummary(text: string): Summary {
 			}
 			case 'assistant': {
 				const m = o.message ?? {};
-				if (m.model && m.model !== '<synthetic>' && m.usage) usageById.set(m.id ?? o.uuid, [m.model, m.usage]);
+				if (m.model && m.model !== '<synthetic>' && m.usage) {
+					const id = m.id ?? o.uuid;
+					usageById.set(id, [m.model, m.usage, usageById.get(id)?.[2] ?? ts]);
+				}
 				nAsst++;
 				break;
 			}
@@ -83,10 +86,12 @@ export function claudeSummary(text: string): Summary {
 
 	const tokens = emptyTokens();
 	const models: Record<string, Tokens> = {};
-	for (const [model, u] of usageById.values()) {
+	const calls: Call[] = [];
+	for (const [id, [model, u, time]] of usageById) {
 		const d = usageTokens(u);
 		addTokens(tokens, d);
 		addTokens((models[model] ??= emptyTokens()), d);
+		calls.push([id, model, time, d.input!, d.output!, d.cache_read!, d.cache_write!]);
 	}
 	return {
 		title: custom || oneLine(first) || '(no prompt)',
@@ -100,7 +105,8 @@ export function claudeSummary(text: string): Summary {
 		cost,
 		turns: nUser,
 		messages: nUser + nAsst,
-		client: entrypoint
+		client: entrypoint,
+		calls
 	};
 }
 

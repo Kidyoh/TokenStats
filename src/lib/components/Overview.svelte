@@ -5,18 +5,27 @@
 	import Icon from './Icon.svelte';
 	import ShareDialog from './ShareDialog.svelte';
 	import type { CardData } from '#lib/sharecard.ts';
+	import type { CoverageNote, HistoryEntry } from '#lib/history.ts';
 
-	let { sessions, rangeDays = null, onopen }: { sessions: Session[]; rangeDays?: number | null; onopen: (id: string) => void } = $props();
+	let {
+		sessions,
+		history = [],
+		notes = [],
+		rangeDays = null,
+		onopen
+	}: { sessions: Session[]; history?: HistoryEntry[]; notes?: CoverageNote[]; rangeDays?: number | null; onopen: (id: string) => void } = $props();
 
 	// Estimated cost per session from models.dev list prices
 	const prices = $derived(new Map(sessions.map((s) => [s.id, priceSession(s)])));
-	const unpriced = $derived([...new Set([...prices.values()].flatMap((p) => p.unpriced))]);
-	const grandUsd = $derived([...prices.values()].reduce((a, p) => a + p.usd, 0));
+	const histPrices = $derived(history.map((h) => priceSession({ ...h, subagents: [] })));
+	const unpriced = $derived([...new Set([...prices.values(), ...histPrices].flatMap((p) => p.unpriced))]);
+	const grandUsd = $derived([...prices.values(), ...histPrices].reduce((a, p) => a + p.usd, 0));
 
 	const byTool = $derived.by(() => {
-		const by = new Map<Tool, { n: number; t: Tokens; usd: number; est: number; real: number }>();
+		const by = new Map<Tool, { n: number; t: Tokens; usd: number; est: number; real: number; hist: number; origins: Set<string> }>();
+		const get = (t: Tool) => by.get(t) ?? { n: 0, t: emptyTokens(), usd: 0, est: 0, real: 0, hist: 0, origins: new Set<string>() };
 		for (const s of sessions) {
-			const b = by.get(s.source) ?? { n: 0, t: emptyTokens(), usd: 0, est: 0, real: 0 };
+			const b = get(s.source);
 			b.n++;
 			if (s.estimated) b.est++;
 			else if (sessionTotal(s)) b.real++;
@@ -24,8 +33,21 @@
 			b.usd += prices.get(s.id)?.usd ?? 0;
 			by.set(s.source, b);
 		}
+		history.forEach((h, i) => {
+			const b = get(h.source);
+			addTokens(b.t, h.tokens);
+			b.hist += totalTokens(h.tokens);
+			b.real++;
+			b.origins.add(h.origin);
+			b.usd += histPrices[i]?.usd ?? 0;
+			by.set(h.source, b);
+		});
 		return TOOL_IDS.filter((k) => by.has(k)).map((k) => ({ tool: k, ...by.get(k)! }));
 	});
+	/** tokens recovered from the agents' own totals, whose session files are gone */
+	const histTotal = $derived(history.reduce((a, h) => a + totalTokens(h.tokens), 0));
+	/** periods whose usage can't be counted at all */
+	const gaps = $derived(notes.filter((n) => n.kind === 'gap'));
 	/** tokens counted from transcript text because the tool recorded none */
 	const estTotal = $derived(sessions.reduce((a, s) => a + (s.estimated ? sessionTotal(s) : 0), 0));
 	const grand = $derived(byTool.reduce((a, b) => a + totalTokens(b.t), 0));
@@ -37,6 +59,17 @@
 		// Rows are per model; for a tool with a model chosen in Settings, its rows are kept apart
 		// and priced at that model instead (`as`).
 		const m = new Map<string, { src: Tool; name: string; n: number; t: Tokens; as: string | null }>();
+		const tally = (src: Tool, models: Record<string, Tokens>) => {
+			const override = assumedModel(src);
+			const as = override && findPrice(override, src) ? override : null;
+			for (const [name, t] of Object.entries(models)) {
+				const key = as ? `${src}|${name}` : name;
+				const x = m.get(key) ?? { src, name, n: 0, t: emptyTokens(), as };
+				addTokens(x.t, t);
+				m.set(key, x);
+			}
+		};
+		for (const h of history) tally(h.source, h.models);
 		for (const s of sessions) {
 			const seen = new Set<string>();
 			const override = assumedModel(s.source);
@@ -64,7 +97,7 @@
 	// The chart covers the chosen range; for all time, from the first session (30 days to a year).
 	const DAYS = $derived.by(() => {
 		if (rangeDays) return rangeDays;
-		const first = Math.min(...sessions.map((s) => s.end ?? s.start ?? Date.now()));
+		const first = Math.min(...sessions.map((s) => s.end ?? s.start ?? Date.now()), ...history.map((h) => h.from));
 		return Math.max(30, Math.min(365, Math.ceil((Date.now() - first) / 864e5) + 1));
 	});
 	const chart = $derived.by(() => {
@@ -80,6 +113,16 @@
 			const v = sessionTotal(s);
 			buckets[i].v[s.source] = (buckets[i].v[s.source] ?? 0) + v;
 			buckets[i].total += v;
+		}
+		// Recovered usage: on its day, or spread evenly when only the period is known.
+		for (const h of history) {
+			const first = Math.round((h.from - start) / 864e5);
+			const days = Math.round((h.to - h.from) / 864e5) + 1;
+			const v = totalTokens(h.tokens) / days;
+			for (let i = Math.max(0, first); i < Math.min(DAYS, first + days); i++) {
+				buckets[i].v[h.source] = (buckets[i].v[h.source] ?? 0) + v;
+				buckets[i].total += v;
+			}
 		}
 		return { buckets, max: Math.max(1, ...buckets.map((b) => b.total)), start };
 	});
@@ -98,7 +141,7 @@
 			0
 		);
 		return {
-			rangeLabel: !rangeDays ? 'All time' : rangeDays === 365 ? 'Last 12 months' : `Last ${rangeDays} days`,
+			rangeLabel: (!rangeDays ? 'All time' : rangeDays === 365 ? 'Last 12 months' : `Last ${rangeDays} days`) + (gaps.length ? ' · incomplete' : ''),
 			sessions: sessions.length,
 			tokens: grand,
 			cost: grandUsd,
@@ -115,14 +158,25 @@
 	<div>
 		<div class="eyebrow">{sessions.length} sessions</div>
 		<div class="totals">
-			<div class="big">{fmt(grand)} <span>tokens</span></div>
+			<div class="big">{fmt(grand)} <span>tokens</span>{#if gaps.length}<span class="partial" title="Some usage in this range couldn't be counted. See the notes below.">incomplete</span>{/if}</div>
 			<div class="big cost" title="Estimated at list prices from models.dev">{usd(grandUsd)} <span>estimated</span></div>
 		</div>
 		<div class="split">
-			{fmt(grandT.input)} in · {fmt(grandT.output)} out · {fmt(grandT.cache_read)} cache read{#if grandT.cache_write}&nbsp;· {fmt(grandT.cache_write)} cache write{/if}{#if estTotal}&nbsp;· <span title="Counted from transcript text for sessions whose tool didn't record usage">incl. ~{fmt(estTotal)} estimated</span>{/if}
+			{fmt(grandT.input)} in · {fmt(grandT.output)} out · {fmt(grandT.cache_read)} cache read{#if grandT.cache_write}&nbsp;· {fmt(grandT.cache_write)} cache write{/if}{#if estTotal}&nbsp;· <span title="Counted from transcript text for sessions whose tool didn't record usage">incl. ~{fmt(estTotal)} estimated</span>{/if}{#if histTotal}&nbsp;· <span title="From the agents' own running totals, for sessions whose files were deleted">incl. {fmt(histTotal)} from older records</span>{/if}
 		</div>
 	</div>
 </header>
+
+{#if notes.length}
+	<ul class="coverage" aria-label="What these totals include">
+		{#each notes as n, i (i)}
+			<li class={n.kind}>
+				<span class="dot {n.source}"></span>
+				<span><b>{TOOLS[n.source]}</b>{n.kind === 'gap' ? ' · missing usage' : n.kind === 'missing' ? ' · no usage data' : n.kind === 'tip' ? ' · keep more history' : ''}. {n.text}</span>
+			</li>
+		{/each}
+	</ul>
+{/if}
 
 <div class="tools">
 	{#each byTool as b (b.tool)}
@@ -131,7 +185,11 @@
 			<span class="bar">{#if totalTokens(b.t)}<i style="width:{(totalTokens(b.t) / maxTool) * 100}%;background:var(--{b.tool})"></i>{/if}</span>
 			<span class="num">{totalTokens(b.t) ? (b.est && !b.real ? '~' : '') + fmt(totalTokens(b.t)) : '—'}</span>
 			<span class="usd" title={totalTokens(b.t) && !b.usd ? 'No model recorded, so no price' : undefined}>{totalTokens(b.t) ? (b.usd ? usd(b.usd) : '—') : ''}</span>
-			<span class="sub">{b.n} {b.n === 1 ? 'session' : 'sessions'}{!totalTokens(b.t) ? ' · no token data' : b.est && !b.real ? ' · estimated' : b.est ? ` · ${b.est} estimated` : ''}</span>
+			<span class="sub"
+				>{b.n} {b.n === 1 ? 'session' : 'sessions'}{!totalTokens(b.t) ? ' · no token data' : b.est && !b.real ? ' · estimated' : b.est ? ` · ${b.est} estimated` : ''}{#if b.hist}<span title="Recovered from {[...b.origins].join(', ')}"
+						>&nbsp;· +{fmt(b.hist)} older</span
+					>{/if}</span
+			>
 		</div>
 	{/each}
 </div>
@@ -194,7 +252,7 @@
 				{#each models as [key, x] (key)}
 					<tr>
 						<td><span class="dot {x.src}"></span>&nbsp; {x.name}{#if x.as}&nbsp;<span class="muted" title="{TOOLS[x.src]} sessions are priced at the model chosen in Settings">· {TOOLS[x.src]}, priced as {x.as.split('/').pop()}</span>{/if}</td>
-						<td class="muted">{x.n}</td>
+						<td class="muted">{x.n || '—'}</td>
 						<td>{fmt(x.t.input + x.t.cache_write)}</td>
 						<td>{fmt(x.t.output)}</td>
 						<td>{fmt(x.t.cache_read)}</td>
@@ -253,6 +311,42 @@
 		text-align: right;
 		font-variant-numeric: tabular-nums;
 		color: var(--ink-2);
+	}
+	.partial {
+		margin-left: 10px;
+		font-size: 12px !important;
+		font-weight: 600 !important;
+		color: var(--warn) !important;
+		border: 1px solid currentColor;
+		border-radius: 999px;
+		padding: 1px 8px;
+		vertical-align: middle;
+	}
+	.coverage {
+		list-style: none;
+		margin: 16px 0 0;
+		padding: 0;
+		display: grid;
+		gap: 6px;
+		font-size: 12.5px;
+		line-height: 1.5;
+		color: var(--muted);
+	}
+	.coverage li {
+		display: flex;
+		gap: 8px;
+		align-items: baseline;
+		padding: 8px 10px;
+		border-radius: var(--r-sm);
+		background: var(--surface-2);
+	}
+	.coverage li.gap,
+	.coverage li.missing {
+		color: var(--ink-2);
+	}
+	.coverage b {
+		color: var(--ink);
+		font-weight: 600;
 	}
 	.pricing-note {
 		margin: 28px 0 0;

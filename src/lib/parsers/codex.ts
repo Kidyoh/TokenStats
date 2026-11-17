@@ -1,4 +1,5 @@
-import { emptyTokens, type Msg, type Summary, type Tokens } from '../types';
+import type { Database } from 'sql.js';
+import { addTokens, emptyTokens, type Msg, type Summary, type Tokens } from '../types';
 import { clip, isMetaPrompt, lines, ms, oneLine, stripTagBlocks, tryJson } from './common';
 
 function contentText(content: unknown): string {
@@ -13,15 +14,32 @@ function contentText(content: unknown): string {
 	return out.join('\n');
 }
 
+// Codex usage is OpenAI-shaped: input_tokens already includes cached_input_tokens, and output_tokens
+// includes reasoning_output_tokens, so total_tokens = input + output. Cache writes are counted inside
+// input_tokens too unless total_tokens says otherwise.
 function totalsToTokens(t: any): Tokens {
+	const input = t.input_tokens ?? 0;
+	const output = t.output_tokens ?? 0;
 	const cached = t.cached_input_tokens ?? 0;
+	const write = t.cache_write_input_tokens ?? 0;
+	const writeInInput = t.total_tokens == null || t.total_tokens === input + output;
 	return {
-		input: Math.max((t.input_tokens ?? 0) - cached, 0),
-		output: t.output_tokens ?? 0,
+		input: Math.max(input - cached - (writeInInput ? write : 0), 0),
+		output,
 		cache_read: cached,
-		cache_write: t.cache_write_input_tokens ?? 0,
+		cache_write: write,
 		reasoning: t.reasoning_output_tokens ?? 0
 	};
+}
+
+/** What one cumulative reading adds over the previous one. A counter that went down started over. */
+function delta(cur: Tokens, prev: Tokens | null): Tokens {
+	if (!prev) return cur;
+	const d = emptyTokens();
+	const keys = Object.keys(d) as (keyof Tokens)[];
+	if (keys.some((k) => cur[k] < prev[k])) return cur;
+	for (const k of keys) d[k] = cur[k] - prev[k];
+	return d;
 }
 
 export function codexSummary(text: string, path = ''): Summary {
@@ -31,7 +49,12 @@ export function codexSummary(text: string, path = ''): Summary {
 	let title: string | null = null;
 	let start: number | null = null;
 	let end: number | null = null;
-	let total: any = null;
+	// token_count events carry the running total for the session (often repeated); each increase is
+	// credited to the model in use at that point, so sessions that switch models are split correctly.
+	let prev: Tokens | null = null;
+	const tokens = emptyTokens();
+	const models: Record<string, Tokens> = {};
+	const unassigned = emptyTokens();
 	let nUser = 0;
 	let nMsgs = 0;
 
@@ -47,7 +70,12 @@ export function codexSummary(text: string, path = ''): Summary {
 		if (o.type === 'session_meta') meta = p;
 		else if (o.type === 'turn_context') model = p.model ?? model;
 		else if (o.type === 'event_msg' && p.type === 'token_count') {
-			if (p.info?.total_token_usage) total = p.info.total_token_usage;
+			if (!p.info?.total_token_usage) continue;
+			const cur = totalsToTokens(p.info.total_token_usage);
+			const d = delta(cur, prev);
+			prev = cur;
+			addTokens(tokens, d);
+			addTokens(model ? (models[model] ??= emptyTokens()) : unassigned, d);
 		} else if (o.type === 'event_msg' && p.type === 'thread_name_updated') title = p.thread_name ?? title;
 		else if (o.type === 'response_item' && p.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
 			const t = contentText(p.content);
@@ -59,7 +87,9 @@ export function codexSummary(text: string, path = ''): Summary {
 			nMsgs++;
 		}
 	}
-	const tokens = total ? totalsToTokens(total) : emptyTokens();
+	// Usage reported before any model was named belongs to the first model of the session.
+	const firstModel = Object.keys(models)[0] ?? model;
+	if (firstModel && Object.values(unassigned).some(Boolean)) addTokens((models[firstModel] ??= emptyTokens()), unassigned);
 	return {
 		title: title || oneLine(first) || '(no prompt)',
 		first_prompt: oneLine(first, 400),
@@ -68,7 +98,7 @@ export function codexSummary(text: string, path = ''): Summary {
 		start,
 		end,
 		tokens,
-		models: model ? { [model]: { ...tokens } } : {},
+		models,
 		cost: null,
 		turns: nUser,
 		messages: nMsgs,
@@ -144,6 +174,36 @@ export function codexThreadNames(text: string): Record<string, string> {
 		if (o?.id && o.thread_name) names[o.id] = o.thread_name;
 	}
 	return names;
+}
+
+export interface CodexThread {
+	id: string;
+	tokens: number;
+	model: string | null;
+	cwd: string | null;
+	title: string;
+	start: number | null;
+	end: number | null;
+}
+
+/** ~/.codex/state_<n>.sqlite: Codex's own list of threads with each one's total tokens. It outlives deleted rollout files. */
+export function codexThreads(db: Database): CodexThread[] {
+	const cols = new Set((db.exec('pragma table_info(threads)')[0]?.values ?? []).map((r) => String(r[1])));
+	if (!cols.has('id') || !cols.has('tokens_used')) return [];
+	const pick = (c: string, fallback = 'null') => (cols.has(c) ? c : fallback);
+	const st = db.prepare(
+		`select id, tokens_used, ${pick('model')}, ${pick('cwd')}, ${pick('title', "''")}, ${pick('created_at')}, ${pick('updated_at')} from threads where tokens_used > 0`
+	);
+	const out: CodexThread[] = [];
+	try {
+		while (st.step()) {
+			const [id, tokens, model, cwd, title, created, updated] = st.get() as [string, number, string | null, string | null, string | null, number | null, number | null];
+			out.push({ id, tokens: Number(tokens), model: model || null, cwd: cwd || null, title: title ?? '', start: ms(created), end: ms(updated) ?? ms(created) });
+		}
+	} finally {
+		st.free();
+	}
+	return out;
 }
 
 /** rollout-2026-11-06T03-06-40-<uuid>.jsonl[.zst] -> uuid */

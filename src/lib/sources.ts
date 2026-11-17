@@ -6,8 +6,12 @@ import type { Tool } from './types';
 export type EntryKind =
 	| 'claude'
 	| 'claude-sub'
+	| 'claude-stats'
+	| 'claude-settings'
 	| 'codex'
 	| 'codex-index'
+	| 'codex-state'
+	| 'codex-state-wal'
 	| 'oc-db'
 	| 'oc-wal'
 	| 'grok-chat'
@@ -18,7 +22,8 @@ export type EntryKind =
 	| 'ag-db'
 	| 'ag-wal'
 	| 'ag-index'
-	| 'ag-index-wal';
+	| 'ag-index-wal'
+	| 'ag-pb';
 
 export interface Entry {
 	kind: EntryKind;
@@ -64,9 +69,16 @@ export function classify(segs: string[]): Omit<Entry, 'file' | 'path'> | null {
 	if (name === 'conversation_summaries.db-wal') return { kind: 'ag-index-wal' };
 	const agm = /^([0-9a-f-]{36})\.db(-wal)?$/i.exec(name);
 	if (agm && parent === 'conversations') return { kind: agm[2] ? 'ag-wal' : 'ag-db', sid: agm[1] };
+	// Older Antigravity conversations are encrypted .pb files: counted, not read
+	if (/^[0-9a-f-]{36}\.pb$/i.test(name) && parent === 'conversations') return { kind: 'ag-pb', sid: name.slice(0, 36) };
 	if (/^rollout-.*\.jsonl(\.zst)?$/.test(name)) return { kind: 'codex', sid: name.split('.')[0].slice(-36) };
 	if (name === 'session_index.jsonl' && segs.includes('.codex')) return { kind: 'codex-index' };
 	if (name === 'session_index.jsonl' && segs.length === 2) return { kind: 'codex-index' };
+	// Running totals that outlive deleted session files
+	const state = /^state_\d+\.sqlite(-wal)?$/.exec(name);
+	if (state && (segs.includes('.codex') || segs.length === 2)) return { kind: state[1] ? 'codex-state-wal' : 'codex-state' };
+	if (name === 'stats-cache.json' && (parent === '.claude' || segs.length === 2)) return { kind: 'claude-stats' };
+	if (name === 'settings.json' && parent === '.claude') return { kind: 'claude-settings' };
 	if (name === 'opencode.db') return { kind: 'oc-db' };
 	if (name === 'opencode.db-wal') return { kind: 'oc-wal' };
 	if (!name.endsWith('.jsonl')) return null;
@@ -87,7 +99,7 @@ function childFilter(dirName: string, childNames: string[]): (name: string, isDi
 		case '.claude':
 			return (n, d) => !d || n === 'projects';
 		case '.codex':
-			return (n, d) => (d ? ['sessions', 'archived_sessions'].includes(n) : n === 'session_index.jsonl');
+			return (n, d) => (d ? ['sessions', 'archived_sessions'].includes(n) : n === 'session_index.jsonl' || /^state_\d+\.sqlite(-wal)?$/.test(n));
 		case '.local':
 			return (n, d) => d && n === 'share';
 		case 'share':
@@ -101,7 +113,7 @@ function childFilter(dirName: string, childNames: string[]): (name: string, isDi
 		case 'antigravity':
 			return (n, d) => (d ? n === 'conversations' : n.startsWith('conversation_summaries.db'));
 		case 'conversations':
-			return (n, d) => !d && /\.db(-wal)?$/.test(n);
+			return (n, d) => !d && /\.(db(-wal)?|pb)$/.test(n);
 		case '.cursor':
 			return (n, d) => d && n === 'projects';
 	}

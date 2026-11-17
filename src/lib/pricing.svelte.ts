@@ -252,8 +252,8 @@ export function searchModels(list: ModelOption[], query: string, preferred: stri
 
 const hasTokens = (t: Partial<Tokens>) => (t.input ?? 0) + (t.output ?? 0) + (t.cache_read ?? 0) + (t.cache_write ?? 0) > 0;
 
-/** Estimated cost of a session, including the subagents it spawned. */
-export function priceSession(s: Session): SessionPrice {
+/** Estimated cost of a session, including the subagents it spawned (also used for recovered usage, with none). */
+export function priceSession(s: Pick<Session, 'source' | 'tokens' | 'models' | 'subagents'>): SessionPrice {
 	// A model chosen in Settings replaces whatever the session recorded.
 	const override = assumedModel(s.source);
 	const op = override ? findPrice(override, s.source) : null;

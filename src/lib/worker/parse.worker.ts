@@ -6,7 +6,7 @@ import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
 import wasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
 import { antigravityIndex, antigravityMessages, antigravitySummary } from '../parsers/antigravity';
 import { claudeMessages, claudeSearchable, claudeSummary } from '../parsers/claude';
-import { codexMessages, codexSummary } from '../parsers/codex';
+import { codexMessages, codexSummary, codexThreads } from '../parsers/codex';
 import { lines, snippetAround } from '../parsers/common';
 import { cursorMessages, cursorSummary } from '../parsers/cursor';
 import { grokMessages, grokSummary } from '../parsers/grok';
@@ -138,10 +138,11 @@ async function handle(req: Req): Promise<unknown> {
 			return messages(req.unit);
 		case 'search':
 			return search(req.q, req.units);
-		case 'ag-index': {
+		case 'ag-index':
+		case 'codex-state': {
 			const db = await openDb(req.db, req.wal);
 			try {
-				return antigravityIndex(db);
+				return req.op === 'ag-index' ? antigravityIndex(db) : codexThreads(db);
 			} finally {
 				db.close();
 			}
