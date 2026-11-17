@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { claudeCoverage, claudeRetention, codexCoverage, dayStart, dedupeCalls, otherNotes, parseClaudeStatsCache, parseDay } from './history';
 import { claudeSummary } from './parsers/claude';
 import { codexSummary } from './parsers/codex';
-import { classify } from './sources';
+import { claudeAccount, classify } from './sources';
 import { totalTokens, type Call } from './types';
 
 const day = (s: string) => parseDay(s)!;
@@ -215,6 +215,17 @@ describe('finding the extra files', () => {
 		expect(classify(['.codex', 'state_5.sqlite'])?.kind).toBe('codex-state');
 		expect(classify(['.codex', 'state_5.sqlite-wal'])?.kind).toBe('codex-state-wal');
 		expect(classify(['antigravity', 'conversations', '01233267-0b1d-43a6-8d24-4899c80407ea.pb'])).toEqual({ kind: 'ag-pb', sid: '01233267-0b1d-43a6-8d24-4899c80407ea' });
+	});
+
+	it('finds the files of extra Claude Code accounts and tells accounts apart', () => {
+		expect(classify(['home', '.claude-work', 'stats-cache.json'])?.kind).toBe('claude-stats');
+		expect(classify(['home', '.claude-work', 'settings.json'])?.kind).toBe('claude-settings');
+		expect(classify(['home', '.claudex', 'settings.json'])).toBeNull();
+		const sid = '01233267-0b1d-43a6-8d24-4899c80407ea';
+		expect(claudeAccount(`home/.claude-work/projects/p/${sid}.jsonl`)).toBe('home/.claude-work');
+		expect(claudeAccount(`home/.claude-work/projects/p/${sid}/subagents/agent-1.jsonl`)).toBe('home/.claude-work');
+		expect(claudeAccount('home/.claude-work/stats-cache.json')).toBe('home/.claude-work');
+		expect(claudeAccount(`home/.claude/projects/p/${sid}.jsonl`)).not.toBe(claudeAccount('home/.claude-work/stats-cache.json'));
 	});
 });
 

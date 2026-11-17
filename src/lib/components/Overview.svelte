@@ -15,6 +15,14 @@
 		onopen
 	}: { sessions: Session[]; history?: HistoryEntry[]; notes?: CoverageNote[]; rangeDays?: number | null; onopen: (id: string) => void } = $props();
 
+	/** coverage notes popover, opened from the ⓘ button */
+	let notesOpen = $state(false);
+	let notesEl = $state<HTMLElement>();
+	const closeNotes = (e: Event) => {
+		if (!notesOpen) return;
+		if (e instanceof KeyboardEvent ? e.key === 'Escape' : !notesEl?.contains(e.target as Node)) notesOpen = false;
+	};
+
 	// Estimated cost per session from models.dev list prices
 	const prices = $derived(new Map(sessions.map((s) => [s.id, priceSession(s)])));
 	const histPrices = $derived(history.map((h) => priceSession({ ...h, subagents: [] })));
@@ -158,25 +166,38 @@
 	<div>
 		<div class="eyebrow">{sessions.length} sessions</div>
 		<div class="totals">
-			<div class="big">{fmt(grand)} <span>tokens</span>{#if gaps.length}<span class="partial" title="Some usage in this range couldn't be counted. See the notes below.">incomplete</span>{/if}</div>
+			<div class="big">{fmt(grand)} <span>tokens</span>{#if gaps.length}<span class="partial" title="Some usage in this range couldn't be counted. Click ⓘ for details.">incomplete</span>{/if}</div>
 			<div class="big cost" title="Estimated at list prices from models.dev">{usd(grandUsd)} <span>estimated</span></div>
 		</div>
 		<div class="split">
 			{fmt(grandT.input)} in · {fmt(grandT.output)} out · {fmt(grandT.cache_read)} cache read{#if grandT.cache_write}&nbsp;· {fmt(grandT.cache_write)} cache write{/if}{#if estTotal}&nbsp;· <span title="Counted from transcript text for sessions whose tool didn't record usage">incl. ~{fmt(estTotal)} estimated</span>{/if}{#if histTotal}&nbsp;· <span title="From the agents' own running totals, for sessions whose files were deleted">incl. {fmt(histTotal)} from older records</span>{/if}
 		</div>
 	</div>
+	{#if notes.length}
+		<div class="notes-wrap" bind:this={notesEl}>
+			<button
+				class="info-btn"
+				class:warn={gaps.length}
+				aria-label="What these totals include"
+				aria-expanded={notesOpen}
+				title="What these totals include"
+				onclick={() => (notesOpen = !notesOpen)}><Icon name="info" size={16} /></button
+			>
+			{#if notesOpen}
+				<ul class="coverage" aria-label="What these totals include">
+					{#each notes as n, i (i)}
+						<li class="note-{n.kind}">
+							<span class="dot {n.source}"></span>
+							<span><b>{TOOLS[n.source]}</b>{n.kind === 'gap' ? ' · missing usage' : n.kind === 'missing' ? ' · no usage data' : n.kind === 'tip' ? ' · keep more history' : ''}. {n.text}</span>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</div>
+	{/if}
 </header>
 
-{#if notes.length}
-	<ul class="coverage" aria-label="What these totals include">
-		{#each notes as n, i (i)}
-			<li class={n.kind}>
-				<span class="dot {n.source}"></span>
-				<span><b>{TOOLS[n.source]}</b>{n.kind === 'gap' ? ' · missing usage' : n.kind === 'missing' ? ' · no usage data' : n.kind === 'tip' ? ' · keep more history' : ''}. {n.text}</span>
-			</li>
-		{/each}
-	</ul>
-{/if}
+<svelte:window onclick={closeNotes} onkeydown={closeNotes} />
 
 <div class="tools">
 	{#each byTool as b (b.tool)}
@@ -322,12 +343,45 @@
 		padding: 1px 8px;
 		vertical-align: middle;
 	}
-	.coverage {
-		list-style: none;
-		margin: 16px 0 0;
-		padding: 0;
+	.notes-wrap {
+		position: relative;
+		flex: none;
+	}
+	.info-btn {
 		display: grid;
-		gap: 6px;
+		place-items: center;
+		width: 30px;
+		height: 30px;
+		padding: 0;
+		border: 1px solid var(--line);
+		border-radius: 999px;
+		background: transparent;
+		color: var(--muted);
+		cursor: pointer;
+	}
+	.info-btn:hover,
+	.info-btn[aria-expanded='true'] {
+		color: var(--ink);
+		background: var(--surface-2);
+	}
+	.info-btn.warn {
+		color: var(--warn);
+	}
+	.coverage {
+		position: absolute;
+		top: calc(100% + 8px);
+		right: 0;
+		z-index: 20;
+		width: min(440px, calc(100vw - 32px));
+		list-style: none;
+		margin: 0;
+		padding: 6px;
+		border: 1px solid var(--line);
+		border-radius: var(--r-sm);
+		background: var(--surface);
+		box-shadow: 0 8px 24px rgb(0 0 0 / 0.25);
+		display: grid;
+		gap: 4px;
 		font-size: 12.5px;
 		line-height: 1.5;
 		color: var(--muted);
@@ -340,8 +394,8 @@
 		border-radius: var(--r-sm);
 		background: var(--surface-2);
 	}
-	.coverage li.gap,
-	.coverage li.missing {
+	.coverage li.note-gap,
+	.coverage li.note-missing {
 		color: var(--ink-2);
 	}
 	.coverage b {

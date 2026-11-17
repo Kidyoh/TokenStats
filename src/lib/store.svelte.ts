@@ -2,7 +2,9 @@ import type { AgIndexEntry } from './parsers/antigravity';
 import { codexThreadNames, type CodexThread } from './parsers/codex';
 import { claudeCoverage, claudeRetention, codexCoverage, dedupeCalls, otherNotes, parseClaudeStatsCache, subtractTokens, type Coverage, type CoverageNote, type HistoryEntry } from './history';
 import { idb } from './idb';
-import { collect, ensurePermission, type Entry, type Root } from './sources';
+import { claudeAccount, collect, ensurePermission, type Entry, type Root } from './sources';
+
+type ClaudeFile = { id: string; path: string; start: number | null; calls?: Call[] };
 import { addTokens, emptyTokens, TOOL_IDS, type Call, type Msg, type SearchHit, type Session, type Summary, type Tokens, type Tool } from './types';
 import { Pool } from './worker/pool';
 import type { Unit } from './worker/protocol';
@@ -362,7 +364,8 @@ class App {
 
 		// Claude Code: a response copied into several files (resumed or forked sessions) counts once.
 		const claudeUnits = units.filter((u) => u.unit.tool === 'claude' && summaries.has(u.id));
-		const { calls, extra } = dedupeCalls(claudeUnits.map((u) => ({ id: u.id, start: summaries.get(u.id)!.start, calls: summaries.get(u.id)!.calls })));
+		const claudeFiles = claudeUnits.map((u) => ({ id: u.id, path: u.unit.path, start: summaries.get(u.id)!.start, calls: summaries.get(u.id)!.calls }));
+		const { extra } = dedupeCalls(claudeFiles);
 		for (const u of claudeUnits) {
 			const { calls: _, ...s } = summaries.get(u.id)!;
 			const x = extra.get(u.id);
@@ -421,16 +424,15 @@ class App {
 
 		this.#index = index;
 		this.sessions = [...index.values()].map((l) => l.session);
-		const coverage = await this.#coverage(entries, units, summaries, calls);
+		const coverage = await this.#coverage(entries, units, summaries, claudeFiles);
 		this.history = coverage.history;
 		this.notes = coverage.notes;
 	}
 
 	/** Usage the session files no longer hold, and what can't be counted at all. */
-	async #coverage(entries: Entry[], units: ReturnType<typeof toUnits>, summaries: Map<string, Summary>, calls: Call[]): Promise<Coverage> {
+	async #coverage(entries: Entry[], units: ReturnType<typeof toUnits>, summaries: Map<string, Summary>, claudeFiles: ClaudeFile[]): Promise<Coverage> {
 		const history: HistoryEntry[] = [];
 		const notes: CoverageNote[] = [];
-		const newest = (kind: Entry['kind']) => entries.filter((e) => e.kind === kind).sort((a, b) => b.file.lastModified - a.file.lastModified)[0];
 		const errors = this.errors;
 		const read = async <T>(e: Entry | undefined, fn: (text: string) => T): Promise<T | null> => {
 			try {
@@ -441,14 +443,38 @@ class App {
 			}
 		};
 
-		const statsFile = newest('claude-stats');
-		if (calls.length || statsFile) {
-			const cache = await read(statsFile, parseClaudeStatsCache);
-			const settings = newest('claude-settings');
-			const retention = settings ? await read(settings, claudeRetention) : undefined;
+		// Claude Code, per account: each config folder (~/.claude, ~/.claude-work, ...) keeps its own
+		// stats-cache.json, which only covers that account's transcripts.
+		const accounts = new Map<string, { files: ClaudeFile[]; stats?: Entry; settings?: Entry }>();
+		const account = (key: string) => accounts.get(key) ?? accounts.set(key, { files: [] }).get(key)!;
+		for (const f of claudeFiles) account(claudeAccount(f.path)).files.push(f);
+		for (const e of entries) {
+			if (e.kind !== 'claude-stats' && e.kind !== 'claude-settings') continue;
+			const a = account(claudeAccount(e.path));
+			const key = e.kind === 'claude-stats' ? 'stats' : 'settings';
+			if (!a[key] || e.file.lastModified > a[key].file.lastModified) a[key] = e;
+		}
+		// The same folder added twice (say, home and ~/.claude) shows up under two paths: count it once.
+		const seenStats = new Set<string>();
+		for (const [key, a] of accounts) {
+			if (!a.stats) continue;
+			const fp = `${a.stats.file.size}:${a.stats.file.lastModified}`;
+			if (seenStats.has(fp)) accounts.delete(key);
+			seenStats.add(fp);
+		}
+		const named = [...accounts.values()].filter((a) => a.files.length || a.stats).length > 1;
+		for (const [key, a] of accounts) {
+			const { calls } = dedupeCalls(a.files);
+			if (!calls.length && !a.stats) continue;
+			const cache = await read(a.stats, parseClaudeStatsCache);
+			const retention = a.settings ? await read(a.settings, claudeRetention) : undefined;
 			const c = claudeCoverage({ cache, retention, calls });
 			history.push(...c.history);
-			notes.push(...c.notes);
+			const label = key.split('/').pop() || 'Picked folder';
+			for (const n of c.notes) {
+				const text = named ? `${label}: ${n.text}` : n.text;
+				if (!notes.some((x) => x.source === n.source && x.text === text)) notes.push({ ...n, text });
+			}
 		}
 
 		const state = entries.filter((e) => e.kind === 'codex-state').sort((a, b) => b.path.localeCompare(a.path, undefined, { numeric: true }))[0];

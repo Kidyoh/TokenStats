@@ -51,6 +51,19 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UUIDISH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SKIP_DIRS = new Set(['node_modules', '.git', 'tool-results', 'memory', 'snapshot', 'repos', 'tool-output', 'log', 'logs', 'cache', 'plugins', 'compaction', 'terminal']);
 const HOME_DIRS = ['.claude', '.codex', '.local', '.grok', '.gemini', '.cursor'];
+/** Claude Code config folders: ~/.claude, plus extra accounts kept in e.g. ~/.claude-work (CLAUDE_CONFIG_DIR) */
+const CLAUDE_DIR = /^\.claude([-_.].+)?$/;
+const isHomeDir = (n: string) => HOME_DIRS.includes(n) || CLAUDE_DIR.test(n);
+
+/**
+ * The Claude Code config folder (one per account) a file belongs to, as a path prefix: the folder holding
+ * `projects/` for transcripts, the containing folder for stats-cache.json and settings.json.
+ */
+export function claudeAccount(path: string): string {
+	const segs = path.split('/');
+	const i = segs.lastIndexOf('projects');
+	return (i >= 0 ? segs.slice(0, i) : segs.slice(0, -1)).join('/');
+}
 const GROK_FILES: Record<string, EntryKind> = { 'chat_history.jsonl': 'grok-chat', 'summary.json': 'grok-summary', 'usage.json': 'grok-usage' };
 
 export function classify(segs: string[]): Omit<Entry, 'file' | 'path'> | null {
@@ -77,8 +90,8 @@ export function classify(segs: string[]): Omit<Entry, 'file' | 'path'> | null {
 	// Running totals that outlive deleted session files
 	const state = /^state_\d+\.sqlite(-wal)?$/.exec(name);
 	if (state && (segs.includes('.codex') || segs.length === 2)) return { kind: state[1] ? 'codex-state-wal' : 'codex-state' };
-	if (name === 'stats-cache.json' && (parent === '.claude' || segs.length === 2)) return { kind: 'claude-stats' };
-	if (name === 'settings.json' && parent === '.claude') return { kind: 'claude-settings' };
+	if (name === 'stats-cache.json' && (CLAUDE_DIR.test(parent) || segs.length === 2)) return { kind: 'claude-stats' };
+	if (name === 'settings.json' && CLAUDE_DIR.test(parent)) return { kind: 'claude-settings' };
 	if (name === 'opencode.db') return { kind: 'oc-db' };
 	if (name === 'opencode.db-wal') return { kind: 'oc-wal' };
 	if (!name.endsWith('.jsonl')) return null;
@@ -92,12 +105,11 @@ export function classify(segs: string[]): Omit<Entry, 'file' | 'path'> | null {
 /** Which children of a directory are worth walking into. Keeps a whole-home pick fast. */
 function childFilter(dirName: string, childNames: string[]): (name: string, isDir: boolean) => boolean {
 	const has = (n: string) => childNames.includes(n);
-	if (HOME_DIRS.some(has)) return (n, d) => d && HOME_DIRS.includes(n); // a home folder
+	if (HOME_DIRS.some(has)) return (n, d) => d && isHomeDir(n); // a home folder
 	if (has('chat_history.jsonl')) return (n, d) => !d && n in GROK_FILES; // a Grok session folder
 	if (has('agent-transcripts')) return (n, d) => d && n === 'agent-transcripts'; // a Cursor project folder
+	if (CLAUDE_DIR.test(dirName)) return (n, d) => !d || n === 'projects';
 	switch (dirName) {
-		case '.claude':
-			return (n, d) => !d || n === 'projects';
 		case '.codex':
 			return (n, d) => (d ? ['sessions', 'archived_sessions'].includes(n) : n === 'session_index.jsonl' || /^state_\d+\.sqlite(-wal)?$/.test(n));
 		case '.local':

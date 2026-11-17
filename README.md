@@ -15,6 +15,8 @@ Everything runs in the visitor's browser. People pick (or drag in) their own ses
 | Antigravity | `~/.gemini/antigravity` | `conversations/<id>.db` (SQLite with protobuf steps), `conversation_summaries.db`; older `conversations/<id>.pb` are only counted | yes (inferred, see below) |
 | Cursor | `~/.cursor` | `projects/<project>/agent-transcripts/<id>/<id>.jsonl`, plus `<id>/subagents/*.jsonl` | estimated (see below) |
 
+Extra Claude Code accounts kept in their own config folder (e.g. `~/.claude-work` via `CLAUDE_CONFIG_DIR`) are read too; their sessions show under Claude Code, and each folder's `stats-cache.json` is matched only against that folder's transcripts.
+
 On Windows, `~` is `%USERPROFILE%`. The folder pickers start in Documents, one level below these folders on a default install.
 
 Limits:
